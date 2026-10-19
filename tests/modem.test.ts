@@ -27,7 +27,9 @@ describe("modem", () => {
     expect(Array.from(a.frames[0]!)).toEqual(Array.from(b.frames[0]!));
   });
 
-  test("streams across chunk boundaries", () => {
+  // 15s timeout: the sim decode does full-resolution FFT sync; the live path is
+  // incremental (DemodState) and never accumulates this much unscanned audio.
+  test("streams across chunk boundaries", { timeout: 15_000 }, () => {
     const samples = modulateFrame(frame, BASE);
     const noisy = addNoise(samples, 20, 42);
     // feed in odd 4096-sample chunks like ScriptProcessor does

@@ -29,6 +29,13 @@ function preamble(baseHz: number): Float32Array {
   const chirp = chirpTemplate(baseHz);
   const out = new Float32Array(chirp.length * PREAMBLE_REPS);
   for (let r = 0; r < PREAMBLE_REPS; r++) out.set(chirp, r * chirp.length);
+  // fade only the very edges; the two chirps must stay phase-continuous for sync
+  const fade = Math.round(SAMPLE_RATE * 0.004);
+  for (let i = 0; i < fade; i++) {
+    const g = 0.5 - 0.5 * Math.cos((Math.PI * i) / fade);
+    out[i] = out[i]! * g;
+    out[out.length - 1 - i] = out[out.length - 1 - i]! * g;
+  }
   return out;
 }
 
@@ -36,8 +43,14 @@ function symbolSamples(nibble: number, baseHz: number): Float32Array {
   const n = Math.round((SAMPLE_RATE * SYMBOL_MS) / 1000);
   const out = new Float32Array(n);
   const f = baseHz + nibble * TONE_SPACING;
+  // 4 ms raised-cosine edges (like chirp's tone fades): raw on/off tones click and
+  // splatter, and speaker/mic ringing then corrupts the following symbol.
+  const fade = Math.min(Math.round(SAMPLE_RATE * 0.004), Math.floor(n / 2));
   for (let i = 0; i < n; i++) {
-    out[i] = 0.5 * Math.sin((2 * Math.PI * f * i) / SAMPLE_RATE);
+    let env = 1;
+    if (i < fade) env = 0.5 - 0.5 * Math.cos((Math.PI * i) / fade);
+    else if (i >= n - fade) env = 0.5 - 0.5 * Math.cos((Math.PI * (n - i)) / fade);
+    out[i] = 0.5 * env * Math.sin((2 * Math.PI * f * i) / SAMPLE_RATE);
   }
   return out;
 }
@@ -113,7 +126,7 @@ function bandEnergy(samples: Float32Array, baseHz: number): number {
   return sum;
 }
 
-const SYNC_THRESHOLD = 0.5;
+const SYNC_THRESHOLD = 0.4; // chirp peak measured: 0.62@-8dB, 0.53@-10, 0.49@-11
 
 /**
  * FFT-based normalized cross-correlation sync (exact offsets, O(N log N)).
@@ -173,13 +186,48 @@ function preambleLen(baseHz: number): number {
   return preamble(baseHz).length;
 }
 
-/** Majority vote across each consecutive triple of repeated nibbles. */
+/** Symbol decode: strongest bin, but only if it dominates the runner-up.
+ * The window is fine-tuned ±SEARCH samples for maximum tone power first —
+ * sender/receiver clocks differ by tens of ppm, which slips a frame by tens
+ * of samples (chirp's trick of slow symbols plus per-character re-sync, here
+ * as per-symbol re-sync). Returns -1 (erasure) on a near-tie (noise). */
+const DOMINANCE = 1.3; // winner needs 30% more power than runner-up
+const FINE_SEARCH = 64; // ±1.3 ms of per-symbol timing slack
+const FINE_STRIDE = 32; // coarse first; symbol windows are 4800 wide, this is plenty
+function bestBinDominant(samples: Float32Array, w: number, symN: number, baseHz: number): number {
+  let bestW = w, bestTotal = -1;
+  for (let d = -FINE_SEARCH; d <= FINE_SEARCH; d += FINE_STRIDE) {
+    const a = w + d, b = a + symN;
+    if (a < 0 || b > samples.length) continue;
+    let total = 0;
+    for (let k = 0; k < TONE_COUNT; k++) total += goertzel(samples.subarray(a, b), baseHz + k * TONE_SPACING);
+    if (total > bestTotal) { bestTotal = total; bestW = a; }
+  }
+  const win = samples.subarray(bestW, bestW + symN);
+  let best = -1, second = -1, bestP = 0, secondP = 0;
+  for (let k = 0; k < TONE_COUNT; k++) {
+    const pw = goertzel(win, baseHz + k * TONE_SPACING);
+    if (pw > bestP) { secondP = bestP; second = best; bestP = pw; best = k; }
+    else if (pw > secondP) { secondP = pw; second = k; }
+  }
+  return bestP > secondP * DOMINANCE ? best : -1;
+}
+
+/** Majority vote across each consecutive triple of repeated nibbles; erasures (-1)
+ * don't vote, so two clean copies decide. All-erasure triples yield 0xff (invalid). */
 function deRepeat(nibbles: number[]): Uint8Array {
   const nibCount = Math.floor(nibbles.length / 3);
   const out = new Uint8Array(nibCount);
   for (let i = 0; i < nibCount; i++) {
-    const a = nibbles[3 * i]!, b = nibbles[3 * i + 1]!, c = nibbles[3 * i + 2]!;
-    out[i] = a === b || a === c ? a : b;
+    const votes = [nibbles[3 * i]!, nibbles[3 * i + 1]!, nibbles[3 * i + 2]!];
+    const valid = votes.filter((v) => v >= 0);
+    if (valid.length === 0) { out[i] = 0xff; continue; }
+    // most common valid vote (3 values: first-seen majority wins ties)
+    const counts = new Map<number, number>();
+    for (const v of valid) counts.set(v, (counts.get(v) ?? 0) + 1);
+    let bestV = valid[0]!, bestC = 0;
+    for (const [v, c] of counts) if (c > bestC) { bestC = c; bestV = v; }
+    out[i] = bestV;
   }
   return out;
 }
@@ -247,12 +295,7 @@ export function demodulate(samples: Float32Array, baseHz: number, state?: DemodS
     }
     const headerNibbles: number[] = [];
     for (let w = frameStart; w < headEnd; w += symN) {
-      let bestBin = -1, bestPower = -1;
-      for (let k = 0; k < TONE_COUNT; k++) {
-        const pw = goertzel(samples.subarray(w, w + symN), baseHz + k * TONE_SPACING);
-        if (pw > bestPower) { bestPower = pw; bestBin = k; }
-      }
-      headerNibbles.push(bestBin);
+      headerNibbles.push(bestBinDominant(samples, w, symN, baseHz));
     }
     const header = deRepeat(headerNibbles);
     if (header.length < 6) { pos = frameStart + symN; continue; }
@@ -269,7 +312,9 @@ export function demodulate(samples: Float32Array, baseHz: number, state?: DemodS
     const len = headerBytes[3]!;
     const totalSyms = (6 + len) * 2 * 3; // 4 header + len payload + 2 crc
     const frameEnd = frameStart + totalSyms * symN;
-    if (frameEnd > samples.length) {
+    // Clock drift stretches/shrinks the frame by up to ~symN total; the per-symbol
+    // fine search absorbs it, so treat a shortfall within one symbol as complete.
+    if (frameEnd > samples.length + symN) {
       partialFrame = true;
       if (stateful) { state.scanned = frameStart; state.lock = frameStart; }
       pos = Math.min(frameStart, start + tmplLen);
@@ -277,12 +322,7 @@ export function demodulate(samples: Float32Array, baseHz: number, state?: DemodS
     }
     const nibbles: number[] = [];
     for (let w = frameStart; w < frameEnd; w += symN) {
-      let bestBin = -1, bestPower = -1;
-      for (let k = 0; k < TONE_COUNT; k++) {
-        const pw = goertzel(samples.subarray(w, w + symN), baseHz + k * TONE_SPACING);
-        if (pw > bestPower) { bestPower = pw; bestBin = k; }
-      }
-      nibbles.push(bestBin);
+      nibbles.push(bestBinDominant(samples, w, symN, baseHz));
     }
     const clean = deRepeat(nibbles);
     if (clean.length % 2 === 0) {
