@@ -50,7 +50,25 @@ export class AudioLink {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: { ...MIC_CONSTRAINTS, sampleRate: this.sampleRate },
     });
+    // Mic tap: pump live mic samples into the protocol decoder.
+    // ScriptProcessorNode is deprecated but the only tap that works without a
+    // separate worklet file; 4096-sample chunks are fine at 10 sym/s.
+    const source = this.ctx.createMediaStreamSource(this.stream);
+    this.tap = this.ctx.createScriptProcessor(4096, 1, 1);
+    this.tap.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      this.onMicSamples(new Float32Array(input));
+    };
+    source.connect(this.tap);
+    // ScriptProcessor needs a connected destination to run; route through a
+    // zero-gain node so mic is never audible on the speakers.
+    this.mute = this.ctx.createGain();
+    this.mute.gain.value = 0;
+    this.tap.connect(this.mute).connect(this.ctx.destination);
   }
+
+  private tap?: ScriptProcessorNode;
+  private mute?: GainNode;
 
   send(payload: Uint8Array): void {
     this.protocol.send(payload);
@@ -67,6 +85,8 @@ export class AudioLink {
   }
 
   stop(): void {
+    this.tap?.disconnect();
+    this.mute?.disconnect();
     this.stream?.getTracks().forEach((t) => t.stop());
     void this.ctx?.close();
   }

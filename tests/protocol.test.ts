@@ -74,15 +74,25 @@ describe("protocol over noisy simulated air", () => {
   });
 
   test("lost ACK does not duplicate delivery", () => {
-    const w = makeWire(40, 9);
+    // Wire where B->A (ACKs) are destroyed: sender never hears ACK and retries.
+    const airAtoB: Float32Array[] = [];
+    const airBtoA: Float32Array[] = [];
+    const receivedAtB: { payload: Uint8Array; seq: number }[] = [];
+    const protoA = new Protocol((s) => airAtoB.push(s), () => {}, (s) => airAtoB.push(s));
+    const protoB = new Protocol(
+      (s) => airBtoA.push(s),
+      (payload, seq) => receivedAtB.push({ payload, seq }),
+      (s) => airBtoA.push(s),
+    );
     const payload = new TextEncoder().encode("dup");
-    w.protoA.send(payload);
-    w.pump();
-    // ACK lost: sender still waits; force retransmission by calling send again with same payload
-    w.protoA.send(payload);
-    w.pump();
-    // receiver must dedupe by seq: onReceive fired once
-    expect(w.receivedAtB.length).toBe(1);
+    protoA.send(payload);
+    // round 1: frame delivered, ACK destroyed
+    protoB.onAudio(addNoise(airAtoB.shift()!, 30, 11));
+    protoA.onAudio(new Float32Array(4800)); // "ACK" lost
+    // round 2: sender retries same frame (same seq)
+    protoA.tick();
+    protoB.onAudio(addNoise(airAtoB.shift()!, 30, 12));
+    expect(receivedAtB.length).toBe(1); // deduped by seq
   });
 });
 

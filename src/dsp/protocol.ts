@@ -32,6 +32,11 @@ export class Protocol {
 
   /** Feed received audio into the receiver side. */
   onAudio(samples: Float32Array): void {
+    // ACK detection first: energy at base+4250 releases a pending send.
+    if (this.pending && ackEnergy(samples) > ACK_THRESHOLD) {
+      this.onAck();
+      return;
+    }
     for (const bytes of demodulate(samples, activeBaseHz)) {
       const frame = decodeFrame(bytes);
       if (!frame) continue;
@@ -73,6 +78,21 @@ let activeBaseHz = 2000;
 export function setBaseHz(hz: number): void {
   activeBaseHz = hz;
 }
+
+/** Goertzel energy of the ACK tone bin over the buffer. */
+function ackEnergy(samples: Float32Array): number {
+  const w = (2 * Math.PI * (activeBaseHz + 4250)) / SAMPLE_RATE;
+  const coeff = 2 * Math.cos(w);
+  let s0 = 0, s1 = 0, s2 = 0;
+  for (let i = 0; i < samples.length; i++) {
+    s0 = samples[i]! + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+const ACK_THRESHOLD = 0.05; // tune: relative to buffer energy
 
 /** 100 ms ACK tone at base+4250. */
 function ackTone(): Float32Array {
