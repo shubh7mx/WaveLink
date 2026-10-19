@@ -1,8 +1,9 @@
 # WaveLink demo runbook (SW-41)
 
 ## Build + serve
-1. `npm run build && node serve.mjs`
-2. Note the printed LAN URL; open it on both devices (laptop + tablet) over the same hotspot.
+1. `npx vite --host` (HTTPS with self-signed cert; getUserMedia needs a secure context)
+2. Open the printed https:// URL on both devices (laptop + tablet) over the same hotspot.
+3. Accept the browser's "untrusted certificate" warning on each device (self-signed).
 
 ## Pre-demo checklist
 - [ ] Volume 80% on the sender; media volume, not system.
