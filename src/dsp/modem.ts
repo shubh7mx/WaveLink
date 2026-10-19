@@ -72,8 +72,8 @@ function goertzel(window: Float32Array, freq: number): number {
 /** Normalized cross-correlation of samples against template (sliding, stride 1ms). */
 function findChirp(samples: Float32Array, template: Float32Array): number {
   const tEnergy = template.reduce((s, v) => s + v * v, 0);
-  let best = -1, bestScore = 0;
   const stride = Math.round(SAMPLE_RATE / 1000);
+  // first hit wins: cheap on incremental rescans where the sync sits at offset 0
   for (let off = 0; off + template.length <= samples.length; off += stride) {
     let dot = 0, sEnergy = 0;
     for (let i = 0; i < template.length; i++) {
@@ -81,12 +81,9 @@ function findChirp(samples: Float32Array, template: Float32Array): number {
       sEnergy += samples[off + i]! * samples[off + i]!;
     }
     const score = dot / Math.max(1e-9, Math.sqrt(tEnergy * sEnergy));
-    if (score > bestScore) {
-      bestScore = score;
-      best = off;
-    }
+    if (score > 0.6) return off;
   }
-  return bestScore > 0.6 ? best : -1;
+  return -1;
 }
 
 /** Full-preamble template (both chirps) so the sync peak is unique. */
@@ -105,15 +102,30 @@ function deRepeat(nibbles: number[]): Uint8Array {
   return out;
 }
 
-/** Decode every preamble-anchored frame region found in samples. */
-export function demodulate(samples: Float32Array, baseHz: number): Uint8Array[] {
+export interface DemodResult {
+  frames: Uint8Array[];
+  /** Samples consumed up to and including the last decoded frame; safe trim point. */
+  consumed: number;
+  /** True when a preamble was seen and its frame is still arriving: keep buffering. */
+  partialFrame: boolean;
+}
+
+/** Streaming decode: call repeatedly as samples arrive; trim input to `consumed`. */
+export function demodulate(samples: Float32Array, baseHz: number): DemodResult {
   const symN = Math.round((SAMPLE_RATE * SYMBOL_MS) / 1000);
+  const preLen = preambleTemplate(baseHz).length;
   const out: Uint8Array[] = [];
   let pos = 0;
+  let partialFrame = false;
   while (true) {
     const start = findChirp(samples.subarray(pos), preambleTemplate(baseHz));
-    if (start < 0) break;
-    const frameStart = pos + start + preambleTemplate(baseHz).length;
+    if (start < 0) {
+      // No sync anywhere: everything except a possibly-growing partial preamble is dead.
+      pos = Math.max(0, samples.length - (preLen - 1));
+      break;
+    }
+    void 0;
+    const frameStart = pos + start + preLen;
     // Header first: 4 bytes (sync x2, seq, len) = 24 repeated-nibble symbols.
     const headerSyms = 4 * 2 * 3;
     const headEnd = frameStart + headerSyms * symN;
@@ -141,7 +153,11 @@ export function demodulate(samples: Float32Array, baseHz: number): Uint8Array[] 
     const len = headerBytes[3]!;
     const totalSyms = (6 + len) * 2 * 3; // 4 header + len payload + 2 crc
     const frameEnd = frameStart + totalSyms * symN;
-    if (frameEnd > samples.length) { pos = frameStart + symN; continue; }
+    if (frameEnd > samples.length) {
+      partialFrame = true;
+      pos = frameStart;
+      break;
+    }
     const nibbles: number[] = [];
     for (let w = frameStart; w < frameEnd; w += symN) {
       let bestBin = -1, bestPower = -1;
@@ -162,7 +178,9 @@ export function demodulate(samples: Float32Array, baseHz: number): Uint8Array[] 
     pos = frameEnd; // continue scanning past this frame
     if (pos >= samples.length) break;
   }
-  return out;
+  // On a partial frame, report consumed=0 so the caller keeps the whole
+  // buffer (rescan next call; cheap at our buffer sizes).
+  return { frames: out, consumed: partialFrame ? 0 : pos, partialFrame };
 }
 
 /** Deterministic white Gaussian noise at given SNR vs signal RMS. */

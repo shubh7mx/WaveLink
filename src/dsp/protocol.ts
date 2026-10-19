@@ -4,6 +4,7 @@ import { demodulate, modulateFrame, SAMPLE_RATE } from "./modem";
 const MAX_TRIES = 5;
 
 export class Protocol {
+  private rxBuffer = new Float32Array(0);
   private seq = 0;
   private lastReceivedSeq = -1;
   private pending: { bytes: Uint8Array; tries: number } | null = null;
@@ -30,14 +31,20 @@ export class Protocol {
     this.sendAudio(modulateFrame(this.pending.bytes, activeBaseHz));
   }
 
-  /** Feed received audio into the receiver side. */
+  /** Feed received audio into the receiver side. Buffers chunks until frames decode. */
   onAudio(samples: Float32Array): void {
     // ACK detection first: energy at base+4250 releases a pending send.
     if (this.pending && ackEnergy(samples) > ACK_THRESHOLD) {
       this.onAck();
       return;
     }
-    for (const bytes of demodulate(samples, activeBaseHz)) {
+    this.rxBuffer = concatFloat32(this.rxBuffer, samples);
+    const { frames, consumed } = demodulate(this.rxBuffer, activeBaseHz);
+    if (consumed > 0) this.rxBuffer = this.rxBuffer.subarray(consumed);
+    // Bound the buffer: if nothing decodes after 4 s of audio, something is
+    // wrong (wrong band, mic dead) — reset instead of growing unbounded.
+    if (this.rxBuffer.length > SAMPLE_RATE * 4) this.rxBuffer = new Float32Array(0);
+    for (const bytes of frames) {
       const frame = decodeFrame(bytes);
       if (!frame) continue;
       if (frame.seq !== this.lastReceivedSeq) {
@@ -77,6 +84,13 @@ export class Protocol {
 let activeBaseHz = 2000;
 export function setBaseHz(hz: number): void {
   activeBaseHz = hz;
+}
+
+function concatFloat32(a: Float32Array, b: Float32Array): Float32Array {
+  const out = new Float32Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
+  return out;
 }
 
 /** Goertzel energy of the ACK tone bin over the buffer. */
