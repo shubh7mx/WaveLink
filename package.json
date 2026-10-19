@@ -16,6 +16,8 @@
   "license": "ISC",
   "type": "module",
   "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "jsdom": "^29.1.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.4",
     "vitest": "^4.1.12"
