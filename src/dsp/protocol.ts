@@ -4,7 +4,8 @@ import { demodulate, modulateFrame, SAMPLE_RATE } from "./modem";
 const MAX_TRIES = 5;
 
 export class Protocol {
-  private rxBuffer = new Float32Array(0);
+  private rxBuffer: Float32Array<ArrayBufferLike> = new Float32Array(0);
+  private demodState: { scanned: number; lock: number } | null = null;
   private seq = 0;
   private lastReceivedSeq = -1;
   private pending: { bytes: Uint8Array; tries: number } | null = null;
@@ -39,11 +40,19 @@ export class Protocol {
       return;
     }
     this.rxBuffer = concatFloat32(this.rxBuffer, samples);
-    const { frames, consumed } = demodulate(this.rxBuffer, activeBaseHz);
-    if (consumed > 0) this.rxBuffer = this.rxBuffer.subarray(consumed);
+    if (!this.demodState) this.demodState = { scanned: 0, lock: -1 };
+    const { frames, consumed } = demodulate(this.rxBuffer, activeBaseHz, this.demodState);
+    if (consumed > 0) {
+      this.rxBuffer = this.rxBuffer.subarray(consumed);
+      this.demodState.scanned = Math.max(0, this.demodState.scanned - consumed);
+      this.demodState.lock = this.demodState.lock < 0 ? -1 : Math.max(0, this.demodState.lock - consumed);
+    }
     // Bound the buffer: if nothing decodes after 4 s of audio, something is
     // wrong (wrong band, mic dead) — reset instead of growing unbounded.
-    if (this.rxBuffer.length > SAMPLE_RATE * 4) this.rxBuffer = new Float32Array(0);
+    if (this.rxBuffer.length > SAMPLE_RATE * 4 && this.demodState.lock < 0) {
+      this.rxBuffer = new Float32Array(0);
+      this.demodState.scanned = 0;
+    }
     for (const bytes of frames) {
       const frame = decodeFrame(bytes);
       if (!frame) continue;

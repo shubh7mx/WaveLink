@@ -9,15 +9,18 @@ export const TONE_SPACING = 250;
 export const PREAMBLE_MS = 200;
 export const PREAMBLE_REPS = 2;
 
-/** One period of the up-chirp baseband template, normalized amplitude. */
+/** One period of the up-chirp baseband template, normalized amplitude.
+ * Phase is accumulated (integral of instantaneous frequency) — a proper
+ * linear chirp, whose autocorrelation is broad instead of razor-thin. */
 export function chirpTemplate(baseHz: number): Float32Array {
   const n = Math.round((SAMPLE_RATE * PREAMBLE_MS) / 1000);
   const out = new Float32Array(n);
   const span = 4000; // chirp sweeps base..base+4000, matches tone field
+  let phase = 0;
   for (let i = 0; i < n; i++) {
-    const t = i / SAMPLE_RATE;
     const f = baseHz + (span * i) / n;
-    out[i] = Math.sin(2 * Math.PI * f * t);
+    out[i] = Math.sin(phase);
+    phase += (2 * Math.PI * f) / SAMPLE_RATE;
   }
   return out;
 }
@@ -70,25 +73,104 @@ function goertzel(window: Float32Array, freq: number): number {
 }
 
 /** Normalized cross-correlation of samples against template (sliding, stride 1ms). */
-function findChirp(samples: Float32Array, template: Float32Array): number {
-  const tEnergy = template.reduce((s, v) => s + v * v, 0);
-  const stride = Math.round(SAMPLE_RATE / 1000);
-  // first hit wins: cheap on incremental rescans where the sync sits at offset 0
-  for (let off = 0; off + template.length <= samples.length; off += stride) {
-    let dot = 0, sEnergy = 0;
-    for (let i = 0; i < template.length; i++) {
-      dot += samples[off + i]! * template[i];
-      sEnergy += samples[off + i]! * samples[off + i]!;
+/** Radix-2 in-place FFT (real input treated as complex with zero imag). */
+function fftMag(re: Float64Array, im: Float64Array): void {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = re[i]!, ti = im[i]!;
+      re[i] = re[j]!; im[i] = im[j]!;
+      re[j] = tr; im[j] = ti;
     }
-    const score = dot / Math.max(1e-9, Math.sqrt(tEnergy * sEnergy));
-    if (score > 0.6) return off;
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    for (let i = 0; i < n; i += len) {
+      for (let k = 0; k < len / 2; k++) {
+        const curRe = Math.cos(ang * k), curIm = Math.sin(ang * k); // exact, no drift
+        const uRe = re[i + k]!, uIm = im[i + k]!;
+        const vRe = re[i + k + len / 2]! * curRe - im[i + k + len / 2]! * curIm;
+        const vIm = re[i + k + len / 2]! * curIm + im[i + k + len / 2]! * curRe;
+        re[i + k] = uRe + vRe;
+        im[i + k] = uIm + vIm;
+        re[i + k + len / 2] = uRe - vRe;
+        im[i + k + len / 2] = uIm - vIm;
+      }
+    }
+  }
+}
+
+/** Cheap gate: does this buffer hold meaningful energy in the chirp band? */
+function bandEnergy(samples: Float32Array, baseHz: number): number {
+  let sum = 0;
+  const step = Math.max(1, Math.floor(samples.length / 64));
+  for (let i = 0; i + 512 <= samples.length; i += step) {
+    sum += goertzel(samples.subarray(i, i + 512), baseHz + 2000);
+  }
+  return sum;
+}
+
+const SYNC_THRESHOLD = 0.5;
+
+/**
+ * FFT-based normalized cross-correlation sync (exact offsets, O(N log N)).
+ * Single-chirp template; true chirp mainlobe is ~12 samples wide, so only
+ * full-resolution correlation finds it — stride sampling provably misses.
+ */
+/** Absolute-index search over samples[from..]; findChirp works on the subarray and shifts back. */
+function findChirpFrom(samples: Float32Array, template: Float32Array, baseHz: number, from: number): number {
+  const hit = findChirp(samples.subarray(from), template, baseHz);
+  return hit < 0 ? -1 : from + hit;
+}
+
+function findChirp(samples: Float32Array, template: Float32Array, baseHz: number): number {
+  const n = samples.length, m = template.length;
+  if (n < m) return -1;
+  const size = 1 << Math.ceil(Math.log2(n + m));
+  const reS = new Float64Array(size), imS = new Float64Array(size);
+  const reT = new Float64Array(size), imT = new Float64Array(size);
+  reS.set(samples);
+  // template reversed => correlation becomes convolution => single forward FFT pair
+  for (let i = 0; i < m; i++) reT[i] = template[m - 1 - i]!;
+  fftMag(reS, imS);
+  fftMag(reT, imT);
+  const reC = new Float64Array(size), imC = new Float64Array(size);
+  for (let i = 0; i < size; i++) {
+    reC[i] = reS[i]! * reT[i]! - imS[i]! * imT[i]!;
+    imC[i] = reS[i]! * imT[i]! + imS[i]! * reT[i]!;
+  }
+  // inverse FFT via conjugation trick (conj trick omits the 1/N — apply it here)
+  for (let i = 0; i < size; i++) imC[i] = -imC[i]!;
+  fftMag(reC, imC);
+  const invN = 1 / size;
+  for (let i = 0; i < size; i++) reC[i] = reC[i]! * invN;
+  const tEnergy = template.reduce((s, v) => s + v * v, 0);
+  let sEnergy = 0;
+  const pre = new Float64Array(n); // running window energy via prefix sums
+  for (let i = 0; i < n; i++) {
+    pre[i] = sEnergy + samples[i]! * samples[i]!;
+    sEnergy = pre[i]!;
+  }
+  // First offset past threshold wins: the preamble is two identical chirps, and
+  // picking the global max lets noise make the second chirp win the tie, locking
+  // one chirp late. Earliest true peak is also the correct preamble alignment.
+  for (let off = m - 1; off < n; off++) {
+    // correlation index: conv result at off corresponds to alignment start = off-(m-1)
+    const start = off - (m - 1);
+    const dot = reC[off]!;
+    const wEnd = start + m - 1;
+    const wEnergy = pre[wEnd]! - (start > 0 ? pre[start - 1]! : 0);
+    const score = dot / Math.max(1e-9, Math.sqrt(tEnergy * Math.max(1e-9, wEnergy)));
+    if (score > SYNC_THRESHOLD) return start;
   }
   return -1;
 }
 
-/** Full-preamble template (both chirps) so the sync peak is unique. */
-function preambleTemplate(baseHz: number): Float32Array {
-  return preamble(baseHz);
+function preambleLen(baseHz: number): number {
+  return preamble(baseHz).length;
 }
 
 /** Majority vote across each consecutive triple of repeated nibbles. */
@@ -110,26 +192,59 @@ export interface DemodResult {
   partialFrame: boolean;
 }
 
-/** Streaming decode: call repeatedly as samples arrive; trim input to `consumed`. */
-export function demodulate(samples: Float32Array, baseHz: number): DemodResult {
+/** Decode state carried across streaming calls; keeps rescans incremental. */
+export interface DemodState {
+  /** Number of leading samples already fully scanned (never a sync start). */
+  scanned: number;
+  /**
+   * Buffer offset where the preamble of the frame currently in flight starts.
+   * The caller must NOT trim the buffer below this point until the frame
+   * completes (a no-sync rescan must not retreat past it either).
+   */
+  lock: number;
+}
+
+/** Streaming decode: call repeatedly as samples arrive; trim input to `consumed`.
+ * Pass the same state object each call to avoid rescanning earlier samples. */
+export function demodulate(samples: Float32Array, baseHz: number, state?: DemodState): DemodResult {
   const symN = Math.round((SAMPLE_RATE * SYMBOL_MS) / 1000);
-  const preLen = preambleTemplate(baseHz).length;
+  const tmplLen = chirpTemplate(baseHz).length;
+  const preLen = preambleLen(baseHz);
   const out: Uint8Array[] = [];
-  let pos = 0;
+  const stateful = state !== undefined;
+  const lock = state ? state.lock : -1;
+  let pos = state ? state.scanned : 0;
   let partialFrame = false;
+  let consumed = 0;
   while (true) {
-    const start = findChirp(samples.subarray(pos), preambleTemplate(baseHz));
+    let start: number;
+    if (lock >= 0) {
+      // Frame in flight: its preamble was already found; decode once its samples
+      // arrive (start relative to the buffer, may be negative while preamble ends).
+      start = lock - preLen;
+    } else {
+      start = findChirpFrom(samples, chirpTemplate(baseHz), baseHz, pos);
+    }
     if (start < 0) {
-      // No sync anywhere: everything except a possibly-growing partial preamble is dead.
-      pos = Math.max(0, samples.length - (preLen - 1));
+      // No sync anywhere: everything except a possibly-growing partial preamble
+      // is dead. With a frame in flight (lock active) consume nothing — the
+      // preamble itself may still be coming in.
+      if (stateful) state.scanned = lock >= 0 ? 0 : Math.max(0, samples.length - (preLen - 1));
       break;
     }
-    void 0;
-    const frameStart = pos + start + preLen;
+    const frameStart = lock >= 0 ? lock : start + preLen; // preLen = full preamble (2 chirps)
     // Header first: 4 bytes (sync x2, seq, len) = 24 repeated-nibble symbols.
     const headerSyms = 4 * 2 * 3;
     const headEnd = frameStart + headerSyms * symN;
-    if (headEnd > samples.length) break;
+    if (headEnd > samples.length) {
+      // Preamble seen, header incomplete: keep the whole buffer (consumed=0) and
+      // mark only up to one chirp past the locked sync — the second preamble chirp
+      // may still be arriving, so frameStart itself can be beyond the buffer.
+      partialFrame = true;
+      pos = Math.min(frameStart, start + tmplLen);
+      if (stateful) { state.scanned = pos; state.lock = frameStart; }
+      break;
+    }
     const headerNibbles: number[] = [];
     for (let w = frameStart; w < headEnd; w += symN) {
       let bestBin = -1, bestPower = -1;
@@ -144,6 +259,7 @@ export function demodulate(samples: Float32Array, baseHz: number): DemodResult {
     const syncCheck = header.length >= 8 && (header[0]! | (header[1]! << 4)) === 0xa5 && (header[2]! | (header[3]! << 4)) === 0x5a;
     if (!syncCheck) {
       pos = frameStart + symN;
+      if (stateful) state.lock = -1;
       continue;
     }
     const headerBytes = new Uint8Array(header.length / 2);
@@ -155,7 +271,8 @@ export function demodulate(samples: Float32Array, baseHz: number): DemodResult {
     const frameEnd = frameStart + totalSyms * symN;
     if (frameEnd > samples.length) {
       partialFrame = true;
-      pos = frameStart;
+      if (stateful) { state.scanned = frameStart; state.lock = frameStart; }
+      pos = Math.min(frameStart, start + tmplLen);
       break;
     }
     const nibbles: number[] = [];
@@ -176,11 +293,13 @@ export function demodulate(samples: Float32Array, baseHz: number): DemodResult {
       out.push(bytes);
     }
     pos = frameEnd; // continue scanning past this frame
+    if (stateful) state.lock = -1;
     if (pos >= samples.length) break;
   }
   // On a partial frame, report consumed=0 so the caller keeps the whole
-  // buffer (rescan next call; cheap at our buffer sizes).
-  return { frames: out, consumed: partialFrame ? 0 : pos, partialFrame };
+  // buffer (rescan next call; state.scanned keeps that rescan incremental).
+  consumed = partialFrame ? 0 : pos;
+  return { frames: out, consumed, partialFrame };
 }
 
 /** Deterministic white Gaussian noise at given SNR vs signal RMS. */

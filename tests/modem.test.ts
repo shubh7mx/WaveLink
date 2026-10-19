@@ -33,14 +33,17 @@ describe("modem", () => {
     // feed in odd 4096-sample chunks like ScriptProcessor does
     const got: Uint8Array[] = [];
     let rest = new Float32Array(0);
+    const state = { scanned: 0, lock: -1 };
     for (let off = 0; off < noisy.length; off += 4096) {
       const chunk = noisy.subarray(off, Math.min(off + 4096, noisy.length));
       const merged = new Float32Array(rest.length + chunk.length);
       merged.set(rest);
       merged.set(chunk, rest.length);
-      const { frames, consumed } = demodulate(merged, BASE);
+      const { frames, consumed } = demodulate(merged, BASE, state);
       got.push(...frames);
       rest = merged.subarray(consumed);
+      state.scanned = Math.max(0, state.scanned - consumed);
+      state.lock = state.lock < 0 ? -1 : Math.max(0, state.lock - consumed);
     }
     expect(got.length).toBe(1);
     expect(Array.from(got[0]!)).toEqual(Array.from(frame));

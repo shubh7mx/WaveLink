@@ -17,7 +17,7 @@ describe("frame codec", () => {
 
   test("corrupted payload decodes to null", () => {
     const bytes = encodeFrame(1, new Uint8Array([10, 20, 30]));
-    bytes[4] ^= 0xff; // first payload byte
+    bytes[4] = bytes[4]! ^ 0xff; // first payload byte
     expect(decodeFrame(bytes)).toBeNull();
   });
 

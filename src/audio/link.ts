@@ -47,6 +47,7 @@ export class AudioLink {
   async start(onReceive: (payload: Uint8Array, seq: number) => void): Promise<void> {
     this.onReceive = onReceive;
     this.ctx = new AudioContext({ sampleRate: this.sampleRate });
+    await this.ctx.resume(); // may still be suspended until first gesture
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: { ...MIC_CONSTRAINTS, sampleRate: this.sampleRate },
     });
@@ -71,6 +72,8 @@ export class AudioLink {
   private mute?: GainNode;
 
   send(payload: Uint8Array): void {
+    // Chrome suspends AudioContext until a user gesture; send IS the gesture.
+    void this.ctx?.resume();
     this.protocol.send(payload);
   }
 
@@ -94,7 +97,7 @@ export class AudioLink {
   private playOnContext(samples: Float32Array): void {
     if (!this.ctx) return;
     const buffer = this.ctx.createBuffer(1, samples.length, this.sampleRate);
-    buffer.copyToChannel(samples, 0);
+    buffer.copyToChannel(samples as Float32Array<ArrayBuffer>, 0);
     const src = this.ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(this.ctx.destination);
