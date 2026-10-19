@@ -30,6 +30,28 @@ export function buildUi(root: HTMLElement, link: UiLink): void {
     pane.textContent += new TextDecoder().decode(payload);
   });
 
+  // Receive-path debugging: show mic level + detected preamble count so dead
+  // links are diagnosable live on the device.
+  const status = document.createElement("p");
+  status.setAttribute("data-testid", "rx-status");
+  root.appendChild(status);
+  let micChunks = 0;
+  let lastLevel = 0;
+  const probe = (link as unknown as { onMicSamples?: (s: Float32Array) => void }).onMicSamples;
+  if (probe) {
+    const wrapped = (s: Float32Array) => {
+      micChunks++;
+      let peak = 0;
+      for (let i = 0; i < s.length; i += 8) peak = Math.max(peak, Math.abs(s[i]!));
+      lastLevel = peak;
+      probe.call(link, s);
+    };
+    (link as unknown as { onMicSamples: (s: Float32Array) => void }).onMicSamples = wrapped;
+  }
+  setInterval(() => {
+    status.textContent = `mic chunks: ${micChunks} · last peak: ${lastLevel.toFixed(4)}`;
+  }, 500);
+
   // ARQ retry driver
   setInterval(() => link.tick(), 300);
 }

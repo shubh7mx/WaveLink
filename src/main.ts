@@ -13,7 +13,9 @@ async function boot() {
   try {
     const ctx = new AudioContext({ sampleRate: 48000 });
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { ...MIC_CONSTRAINTS } });
+    console.log("[calibration] start", stream.getAudioTracks().length, "audio tracks");
     const baseHz = await calibrate(ctx, stream);
+    console.log("[calibration] chose", baseHz);
     await ctx.close();
     stream.getTracks().forEach((t) => t.stop());
     setBaseHz(baseHz);
