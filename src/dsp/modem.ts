@@ -1,28 +1,43 @@
+import { MAX_PAYLOAD } from "./frame";
+
 /**
  * MFSK acoustic modem: chirp preamble sync + one-of-16 tone symbols.
  * Pure functions over Float32Array; sample rate fixed at 48000.
  */
 export const SAMPLE_RATE = 48000;
-export const SYMBOL_MS = 100;
+export const SYMBOL_MS = 50;
 export const TONE_COUNT = 16;
 export const TONE_SPACING = 250;
 export const PREAMBLE_MS = 200;
-export const PREAMBLE_REPS = 2;
+export const PREAMBLE_REPS = 1;
+
+const chirpCache = new Map<number, { sin: Float32Array; cos: Float32Array }>();
+
+export function complexChirpTemplate(baseHz: number): { sin: Float32Array; cos: Float32Array } {
+  let hit = chirpCache.get(baseHz);
+  if (!hit) {
+    const n = Math.round((SAMPLE_RATE * PREAMBLE_MS) / 1000);
+    const sin = new Float32Array(n);
+    const cos = new Float32Array(n);
+    const span = 4000;
+    let phase = 0;
+    for (let i = 0; i < n; i++) {
+      const f = baseHz + (span * i) / n;
+      sin[i] = Math.sin(phase);
+      cos[i] = Math.cos(phase);
+      phase += (2 * Math.PI * f) / SAMPLE_RATE;
+    }
+    hit = { sin, cos };
+    chirpCache.set(baseHz, hit);
+  }
+  return hit;
+}
 
 /** One period of the up-chirp baseband template, normalized amplitude.
  * Phase is accumulated (integral of instantaneous frequency) — a proper
  * linear chirp, whose autocorrelation is broad instead of razor-thin. */
 export function chirpTemplate(baseHz: number): Float32Array {
-  const n = Math.round((SAMPLE_RATE * PREAMBLE_MS) / 1000);
-  const out = new Float32Array(n);
-  const span = 4000; // chirp sweeps base..base+4000, matches tone field
-  let phase = 0;
-  for (let i = 0; i < n; i++) {
-    const f = baseHz + (span * i) / n;
-    out[i] = Math.sin(phase);
-    phase += (2 * Math.PI * f) / SAMPLE_RATE;
-  }
-  return out;
+  return complexChirpTemplate(baseHz).sin;
 }
 
 function preamble(baseHz: number): Float32Array {
@@ -50,7 +65,7 @@ function symbolSamples(nibble: number, baseHz: number): Float32Array {
     let env = 1;
     if (i < fade) env = 0.5 - 0.5 * Math.cos((Math.PI * i) / fade);
     else if (i >= n - fade) env = 0.5 - 0.5 * Math.cos((Math.PI * (n - i)) / fade);
-    out[i] = 0.5 * env * Math.sin((2 * Math.PI * f * i) / SAMPLE_RATE);
+    out[i] = 0.9 * env * Math.sin((2 * Math.PI * f * i) / SAMPLE_RATE);
   }
   return out;
 }
@@ -85,6 +100,24 @@ function goertzel(window: Float32Array, freq: number): number {
   return s1 * s1 + s2 * s2 - coeff * s1 * s2;
 }
 
+const twiddleCache = new Map<number, { re: Float64Array; im: Float64Array }>();
+function getTwiddles(len: number): { re: Float64Array; im: Float64Array } {
+  let tw = twiddleCache.get(len);
+  if (!tw) {
+    const half = len >> 1;
+    const re = new Float64Array(half);
+    const im = new Float64Array(half);
+    const ang = (-2 * Math.PI) / len;
+    for (let k = 0; k < half; k++) {
+      re[k] = Math.cos(ang * k);
+      im[k] = Math.sin(ang * k);
+    }
+    tw = { re, im };
+    twiddleCache.set(len, tw);
+  }
+  return tw;
+}
+
 /** Normalized cross-correlation of samples against template (sliding, stride 1ms). */
 /** Radix-2 in-place FFT (real input treated as complex with zero imag). */
 function fftMag(re: Float64Array, im: Float64Array): void {
@@ -100,17 +133,21 @@ function fftMag(re: Float64Array, im: Float64Array): void {
     }
   }
   for (let len = 2; len <= n; len <<= 1) {
-    const ang = (-2 * Math.PI) / len;
+    const { re: twRe, im: twIm } = getTwiddles(len);
+    const half = len >> 1;
     for (let i = 0; i < n; i += len) {
-      for (let k = 0; k < len / 2; k++) {
-        const curRe = Math.cos(ang * k), curIm = Math.sin(ang * k); // exact, no drift
-        const uRe = re[i + k]!, uIm = im[i + k]!;
-        const vRe = re[i + k + len / 2]! * curRe - im[i + k + len / 2]! * curIm;
-        const vIm = re[i + k + len / 2]! * curIm + im[i + k + len / 2]! * curRe;
-        re[i + k] = uRe + vRe;
-        im[i + k] = uIm + vIm;
-        re[i + k + len / 2] = uRe - vRe;
-        im[i + k + len / 2] = uIm - vIm;
+      const iHalf = i + half;
+      for (let k = 0; k < half; k++) {
+        const curRe = twRe[k]!, curIm = twIm[k]!;
+        const ik = i + k;
+        const ik2 = iHalf + k;
+        const uRe = re[ik]!, uIm = im[ik]!;
+        const vRe = re[ik2]! * curRe - im[ik2]! * curIm;
+        const vIm = re[ik2]! * curIm + im[ik2]! * curRe;
+        re[ik] = uRe + vRe;
+        im[ik] = uIm + vIm;
+        re[ik2] = uRe - vRe;
+        im[ik2] = uIm - vIm;
       }
     }
   }
@@ -126,7 +163,7 @@ function bandEnergy(samples: Float32Array, baseHz: number): number {
   return sum;
 }
 
-const SYNC_THRESHOLD = 0.4; // chirp peak measured: 0.62@-8dB, 0.53@-10, 0.49@-11
+const SYNC_THRESHOLD = 0.20; // 0.20 reliably detects chirps over real laptop speakers/mics with room reverberation
 
 /**
  * FFT-based normalized cross-correlation sync (exact offsets, O(N log N)).
@@ -135,49 +172,90 @@ const SYNC_THRESHOLD = 0.4; // chirp peak measured: 0.62@-8dB, 0.53@-10, 0.49@-1
  */
 /** Absolute-index search over samples[from..]; findChirp works on the subarray and shifts back. */
 function findChirpFrom(samples: Float32Array, template: Float32Array, baseHz: number, from: number): number {
-  const hit = findChirp(samples.subarray(from), template, baseHz);
+  const hit = findChirp(samples.subarray(from), baseHz);
   return hit < 0 ? -1 : from + hit;
 }
 
-function findChirp(samples: Float32Array, template: Float32Array, baseHz: number): number {
-  const n = samples.length, m = template.length;
+interface TemplateFft {
+  reT: Float64Array;
+  imT: Float64Array;
+  tEnergy: number;
+}
+const templateFftCache = new Map<string, TemplateFft>();
+
+function getTemplateFft(baseHz: number, size: number, m: number, tmpl: { sin: Float32Array; cos: Float32Array }): TemplateFft {
+  const key = `${baseHz}_${size}`;
+  let hit = templateFftCache.get(key);
+  if (!hit) {
+    const reT = new Float64Array(size), imT = new Float64Array(size);
+    for (let i = 0; i < m; i++) {
+      reT[i] = tmpl.sin[m - 1 - i]!;
+      imT[i] = -tmpl.cos[m - 1 - i]!;
+    }
+    fftMag(reT, imT);
+    let tEnergy = 0;
+    for (let i = 0; i < m; i++) tEnergy += tmpl.sin[i]! * tmpl.sin[i]!;
+    hit = { reT, imT, tEnergy };
+    templateFftCache.set(key, hit);
+  }
+  return hit;
+}
+
+function findChirp(samples: Float32Array, baseHz: number): number {
+  const tmpl = complexChirpTemplate(baseHz);
+  const n = samples.length, m = tmpl.sin.length;
   if (n < m) return -1;
   const size = 1 << Math.ceil(Math.log2(n + m));
+  const { reT, imT, tEnergy } = getTemplateFft(baseHz, size, m, tmpl);
   const reS = new Float64Array(size), imS = new Float64Array(size);
-  const reT = new Float64Array(size), imT = new Float64Array(size);
   reS.set(samples);
-  // template reversed => correlation becomes convolution => single forward FFT pair
-  for (let i = 0; i < m; i++) reT[i] = template[m - 1 - i]!;
   fftMag(reS, imS);
-  fftMag(reT, imT);
   const reC = new Float64Array(size), imC = new Float64Array(size);
   for (let i = 0; i < size; i++) {
     reC[i] = reS[i]! * reT[i]! - imS[i]! * imT[i]!;
     imC[i] = reS[i]! * imT[i]! + imS[i]! * reT[i]!;
   }
-  // inverse FFT via conjugation trick (conj trick omits the 1/N — apply it here)
+  // inverse FFT via conjugation trick
   for (let i = 0; i < size; i++) imC[i] = -imC[i]!;
   fftMag(reC, imC);
   const invN = 1 / size;
-  for (let i = 0; i < size; i++) reC[i] = reC[i]! * invN;
-  const tEnergy = template.reduce((s, v) => s + v * v, 0);
+  for (let i = 0; i < size; i++) {
+    reC[i] = reC[i]! * invN;
+    imC[i] = imC[i]! * invN;
+  }
   let sEnergy = 0;
   const pre = new Float64Array(n); // running window energy via prefix sums
   for (let i = 0; i < n; i++) {
     pre[i] = sEnergy + samples[i]! * samples[i]!;
     sEnergy = pre[i]!;
   }
-  // First offset past threshold wins: the preamble is two identical chirps, and
-  // picking the global max lets noise make the second chirp win the tie, locking
-  // one chirp late. Earliest true peak is also the correct preamble alignment.
+  // Search for the correlation peak: quadrature envelope is phase-invariant across 0..360 deg
   for (let off = m - 1; off < n; off++) {
-    // correlation index: conv result at off corresponds to alignment start = off-(m-1)
     const start = off - (m - 1);
-    const dot = reC[off]!;
+    const env = Math.sqrt(reC[off]! * reC[off]! + imC[off]! * imC[off]!);
     const wEnd = start + m - 1;
     const wEnergy = pre[wEnd]! - (start > 0 ? pre[start - 1]! : 0);
-    const score = dot / Math.max(1e-9, Math.sqrt(tEnergy * Math.max(1e-9, wEnergy)));
-    if (score > SYNC_THRESHOLD) return start;
+    const score = env / Math.max(1e-9, Math.sqrt(tEnergy * Math.max(1e-9, wEnergy)));
+    if (score > SYNC_THRESHOLD) {
+      // Find local peak around this detection (mainlobe width ~64 samples)
+      let bestScore = score;
+      let bestStart = start;
+      const searchEnd = Math.min(n - 1, off + 64);
+      for (let pOff = off + 1; pOff <= searchEnd; pOff++) {
+        const pStart = pOff - (m - 1);
+        const pEnv = Math.sqrt(reC[pOff]! * reC[pOff]! + imC[pOff]! * imC[pOff]!);
+        const pwEnd = pStart + m - 1;
+        const pwEnergy = pre[pwEnd]! - (pStart > 0 ? pre[pStart - 1]! : 0);
+        const pScore = pEnv / Math.max(1e-9, Math.sqrt(tEnergy * Math.max(1e-9, pwEnergy)));
+        if (pScore > bestScore) {
+          bestScore = pScore;
+          bestStart = pStart;
+        } else if (pScore < bestScore * 0.7) {
+          break;
+        }
+      }
+      return bestStart;
+    }
   }
   return -1;
 }
@@ -191,19 +269,12 @@ function preambleLen(baseHz: number): number {
  * sender/receiver clocks differ by tens of ppm, which slips a frame by tens
  * of samples (chirp's trick of slow symbols plus per-character re-sync, here
  * as per-symbol re-sync). Returns -1 (erasure) on a near-tie (noise). */
-const DOMINANCE = 1.3; // winner needs 30% more power than runner-up
-const FINE_SEARCH = 64; // ±1.3 ms of per-symbol timing slack
-const FINE_STRIDE = 32; // coarse first; symbol windows are 4800 wide, this is plenty
+const DOMINANCE = 1.04; // 4% dominance with 3x repetition FEC handles multipath reverberation
 function bestBinDominant(samples: Float32Array, w: number, symN: number, baseHz: number): number {
-  let bestW = w, bestTotal = -1;
-  for (let d = -FINE_SEARCH; d <= FINE_SEARCH; d += FINE_STRIDE) {
-    const a = w + d, b = a + symN;
-    if (a < 0 || b > samples.length) continue;
-    let total = 0;
-    for (let k = 0; k < TONE_COUNT; k++) total += goertzel(samples.subarray(a, b), baseHz + k * TONE_SPACING);
-    if (total > bestTotal) { bestTotal = total; bestW = a; }
-  }
-  const win = samples.subarray(bestW, bestW + symN);
+  // Center-window guard interval: skip 15% edges (7.5ms guard against reverberation & transition clicks)
+  const guard = Math.round(symN * 0.15);
+  const win = samples.subarray(w + guard, w + symN - guard);
+  if (win.length < Math.round(symN * 0.7)) return -1;
   let best = -1, second = -1, bestP = 0, secondP = 0;
   for (let k = 0; k < TONE_COUNT; k++) {
     const pw = goertzel(win, baseHz + k * TONE_SPACING);
@@ -238,6 +309,8 @@ export interface DemodResult {
   consumed: number;
   /** True when a preamble was seen and its frame is still arriving: keep buffering. */
   partialFrame: boolean;
+  /** Diagnostic events during demodulation. */
+  events?: string[];
 }
 
 /** Decode state carried across streaming calls; keeps rescans incremental. */
@@ -259,37 +332,39 @@ export function demodulate(samples: Float32Array, baseHz: number, state?: DemodS
   const tmplLen = chirpTemplate(baseHz).length;
   const preLen = preambleLen(baseHz);
   const out: Uint8Array[] = [];
+  const events: string[] = [];
   const stateful = state !== undefined;
-  const lock = state ? state.lock : -1;
+  let currentLock = state ? state.lock : -1;
   let pos = state ? state.scanned : 0;
   let partialFrame = false;
   let consumed = 0;
   while (true) {
     let start: number;
-    if (lock >= 0) {
+    if (currentLock >= 0) {
       // Frame in flight: its preamble was already found; decode once its samples
       // arrive (start relative to the buffer, may be negative while preamble ends).
-      start = lock - preLen;
+      start = currentLock - preLen;
     } else {
       start = findChirpFrom(samples, chirpTemplate(baseHz), baseHz, pos);
+      if (start >= 0) {
+        events.push(`chirp preamble detected (offset: ${start})`);
+      }
     }
     if (start < 0) {
       // No sync anywhere: everything except a possibly-growing partial preamble
       // is dead. With a frame in flight (lock active) consume nothing — the
       // preamble itself may still be coming in.
-      if (stateful) state.scanned = lock >= 0 ? 0 : Math.max(0, samples.length - (preLen - 1));
+      if (stateful) state.scanned = currentLock >= 0 ? 0 : Math.max(0, samples.length - (preLen - 1));
       break;
     }
-    const frameStart = lock >= 0 ? lock : start + preLen; // preLen = full preamble (2 chirps)
+    const frameStart = currentLock >= 0 ? currentLock : start + preLen;
     // Header first: 4 bytes (sync x2, seq, len) = 24 repeated-nibble symbols.
     const headerSyms = 4 * 2 * 3;
     const headEnd = frameStart + headerSyms * symN;
     if (headEnd > samples.length) {
-      // Preamble seen, header incomplete: keep the whole buffer (consumed=0) and
-      // mark only up to one chirp past the locked sync — the second preamble chirp
-      // may still be arriving, so frameStart itself can be beyond the buffer.
       partialFrame = true;
       pos = Math.min(frameStart, start + tmplLen);
+      currentLock = frameStart;
       if (stateful) { state.scanned = pos; state.lock = frameStart; }
       break;
     }
@@ -298,24 +373,38 @@ export function demodulate(samples: Float32Array, baseHz: number, state?: DemodS
       headerNibbles.push(bestBinDominant(samples, w, symN, baseHz));
     }
     const header = deRepeat(headerNibbles);
-    if (header.length < 6) { pos = frameStart + symN; continue; }
-    const syncCheck = header.length >= 8 && (header[0]! | (header[1]! << 4)) === 0xa5 && (header[2]! | (header[3]! << 4)) === 0x5a;
-    if (!syncCheck) {
+    if (header.length < 6) {
       pos = frameStart + symN;
+      currentLock = -1;
       if (stateful) state.lock = -1;
       continue;
     }
+    const syncCheck = header.length >= 8 && (header[0]! | (header[1]! << 4)) === 0xa5 && (header[2]! | (header[3]! << 4)) === 0x5a;
+    if (!syncCheck) {
+      events.push("sync check failed (header corrupted)");
+      pos = frameStart + symN;
+      currentLock = -1;
+      if (stateful) state.lock = -1;
+      continue;
+    }
+    events.push("header locked (sync 0xa55a ok)");
     const headerBytes = new Uint8Array(header.length / 2);
     for (let i = 0; i < headerBytes.length; i++) {
       headerBytes[i] = header[2 * i]! | (header[2 * i + 1]! << 4);
     }
     const len = headerBytes[3]!;
+    if (len > MAX_PAYLOAD) {
+      events.push(`invalid payload length ${len} > ${MAX_PAYLOAD}`);
+      pos = frameStart + symN;
+      currentLock = -1;
+      if (stateful) state.lock = -1;
+      continue;
+    }
     const totalSyms = (6 + len) * 2 * 3; // 4 header + len payload + 2 crc
     const frameEnd = frameStart + totalSyms * symN;
-    // Clock drift stretches/shrinks the frame by up to ~symN total; the per-symbol
-    // fine search absorbs it, so treat a shortfall within one symbol as complete.
     if (frameEnd > samples.length + symN) {
       partialFrame = true;
+      currentLock = frameStart;
       if (stateful) { state.scanned = frameStart; state.lock = frameStart; }
       pos = Math.min(frameStart, start + tmplLen);
       break;
@@ -333,13 +422,14 @@ export function demodulate(samples: Float32Array, baseHz: number, state?: DemodS
       out.push(bytes);
     }
     pos = frameEnd; // continue scanning past this frame
+    currentLock = -1;
     if (stateful) state.lock = -1;
     if (pos >= samples.length) break;
   }
   // On a partial frame, report consumed=0 so the caller keeps the whole
   // buffer (rescan next call; state.scanned keeps that rescan incremental).
   consumed = partialFrame ? 0 : pos;
-  return { frames: out, consumed, partialFrame };
+  return { frames: out, consumed, partialFrame, events };
 }
 
 /** Deterministic white Gaussian noise at given SNR vs signal RMS. */

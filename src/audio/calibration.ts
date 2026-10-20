@@ -17,15 +17,22 @@ export function pickTierFromResponses(
   return 2000;
 }
 
+/** Ordered tiers: highest silent band first, audible fallback last. */
+export const TIERS = [18500, 14500, 2000];
+
 /**
  * Live calibration: play a 500 ms sweep per tier through the speakers,
  * measure mic energy inside [tier, tier+3000] via AnalyserNode FFT bins.
+ * NOTE: this measures the LOCAL speaker->mic loop only — it proves the local
+ * device can emit and hear each band, NOT that the far device can. Real link
+ * quality needs the cross-device handshake (negotiateBand) after both sides
+ * connect, or the operator forcing a tier in the UI.
  * Returns the chosen base frequency.
  */
 export async function calibrate(
   ctx: AudioContext,
   stream: MediaStream,
-  tiers: number[] = [18500, 14500, 2000],
+  tiers: number[] = TIERS,
 ): Promise<number> {
   const responses: Record<number, number> = {};
   for (const tier of tiers) {

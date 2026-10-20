@@ -50,4 +50,14 @@ describe("modem", () => {
     expect(got.length).toBe(1);
     expect(Array.from(got[0]!)).toEqual(Array.from(frame));
   });
+
+  test("decodes with arbitrary phase shift (quadrature sync)", () => {
+    const samples = modulateFrame(frame, BASE);
+    // Invert the signal (180 degree phase shift)
+    const inverted = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i++) inverted[i] = -samples[i]!;
+    const { frames: invFrames } = demodulate(inverted, BASE);
+    expect(invFrames.length).toBe(1);
+    expect(Array.from(invFrames[0]!)).toEqual(Array.from(frame));
+  });
 });
